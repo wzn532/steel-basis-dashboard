@@ -1233,11 +1233,9 @@ HTML = r"""
     }
     .chart-grid {
       display: grid;
-      grid-template-columns: repeat(4, minmax(260px, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 12px;
       align-items: start;
-      overflow-x: auto;
-      padding-bottom: 4px;
     }
     .chart-card {
       min-width: 0;
@@ -1372,7 +1370,7 @@ HTML = r"""
         grid-template-columns: 1fr;
       }
       .chart-grid {
-        grid-template-columns: repeat(4, minmax(260px, 1fr));
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }
       canvas { height: 420px; }
     }
