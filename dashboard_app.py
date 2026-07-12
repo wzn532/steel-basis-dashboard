@@ -11,6 +11,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -22,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 
 ROOT = Path(__file__).resolve().parent
@@ -75,6 +76,10 @@ SPOT_SERIES = {
         "product": "RB",
     },
 }
+SPOT_SHEET_NAME = "现货价格"
+FUTURES_SHEET_NAME = "期货收盘"
+SPOT_HEADERS = ["日期", *[config["excel_column"] for config in SPOT_SERIES.values()]]
+FUTURES_HEADERS = ["日期", "品种", "合约月", "合约代码", "收盘价", "来源", "更新时间"]
 
 
 def now_iso() -> str:
@@ -169,12 +174,200 @@ def parse_number(value: Any) -> float | None:
         return None
 
 
+def excel_error(message: str, path: Path = EXCEL_PATH) -> RuntimeError:
+    return RuntimeError(f"{message}：{path}")
+
+
+def backup_excel(path: Path = EXCEL_PATH) -> str | None:
+    if not path.exists():
+        return None
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = path.with_suffix(path.suffix + f".{timestamp}.bak")
+    try:
+        shutil.copy2(path, backup_path)
+    except PermissionError as exc:
+        raise excel_error("Excel 文件可能正在打开或被占用，备份失败，请关闭后重试", path) from exc
+    except OSError as exc:
+        raise excel_error(f"Excel 备份失败（{exc}）", path) from exc
+    return str(backup_path)
+
+
+def load_business_workbook(path: Path = EXCEL_PATH) -> Workbook:
+    if path.exists():
+        try:
+            return load_workbook(path)
+        except PermissionError as exc:
+            raise excel_error("Excel 文件可能正在打开或被占用，读取失败，请关闭后重试", path) from exc
+    workbook = Workbook()
+    workbook.active.title = SPOT_SHEET_NAME
+    return workbook
+
+
+def row_headers(sheet: Any) -> list[str]:
+    return [str(cell.value).strip() if cell.value is not None else "" for cell in sheet[1]]
+
+
+def ensure_headers(sheet: Any, required_headers: list[str]) -> dict[str, int]:
+    headers = row_headers(sheet)
+    if not any(headers):
+        for idx, header in enumerate(required_headers, start=1):
+            sheet.cell(row=1, column=idx, value=header)
+        headers = list(required_headers)
+    else:
+        for header in required_headers:
+            if header not in headers:
+                sheet.cell(row=1, column=len(headers) + 1, value=header)
+                headers.append(header)
+    return {header: headers.index(header) + 1 for header in required_headers}
+
+
+def ensure_excel_structure(workbook: Workbook) -> tuple[Any, Any]:
+    if SPOT_SHEET_NAME in workbook.sheetnames:
+        spot_sheet = workbook[SPOT_SHEET_NAME]
+    else:
+        candidate = workbook[workbook.sheetnames[0]]
+        candidate_headers = row_headers(candidate)
+        if "日期" in candidate_headers or not any(candidate_headers):
+            candidate.title = SPOT_SHEET_NAME
+            spot_sheet = candidate
+        else:
+            spot_sheet = workbook.create_sheet(SPOT_SHEET_NAME, 0)
+
+    futures_sheet = (
+        workbook[FUTURES_SHEET_NAME]
+        if FUTURES_SHEET_NAME in workbook.sheetnames
+        else workbook.create_sheet(FUTURES_SHEET_NAME)
+    )
+    ensure_headers(spot_sheet, SPOT_HEADERS)
+    ensure_headers(futures_sheet, FUTURES_HEADERS)
+    return spot_sheet, futures_sheet
+
+
+def save_business_workbook(workbook: Workbook, path: Path = EXCEL_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        workbook.save(path)
+    except PermissionError as exc:
+        raise excel_error("Excel 文件可能正在打开或被占用，写入失败，请关闭后重试", path) from exc
+    except OSError as exc:
+        raise excel_error(f"Excel 写入失败（{exc}）", path) from exc
+
+
+def find_date_row(sheet: Any, date_text: str, date_col: int) -> int | None:
+    for row_idx in range(2, sheet.max_row + 1):
+        if parse_date(sheet.cell(row=row_idx, column=date_col).value) == date_text:
+            return row_idx
+    return None
+
+
+def excel_cell_has_value(sheet: Any, row_idx: int, col_idx: int) -> bool:
+    return parse_number(sheet.cell(row=row_idx, column=col_idx).value) is not None
+
+
+def write_spots_to_excel(
+    date_text: str,
+    prices_by_spot: dict[str, float],
+    path: Path = EXCEL_PATH,
+) -> dict[str, Any]:
+    workbook = load_business_workbook(path)
+    spot_sheet, _futures_sheet = ensure_excel_structure(workbook)
+    headers = ensure_headers(spot_sheet, SPOT_HEADERS)
+    date_col = headers["日期"]
+    row_idx = find_date_row(spot_sheet, date_text, date_col)
+    if row_idx is None:
+        row_idx = spot_sheet.max_row + 1
+        spot_sheet.cell(row=row_idx, column=date_col, value=date_text)
+
+    saved: dict[str, float] = {}
+    for spot_key, raw_price in prices_by_spot.items():
+        spot_key = normalize_spot_key(spot_key)
+        price = parse_number(raw_price)
+        if price is None:
+            raise_value(f"Invalid spot price for {spot_key}")
+        column_name = str(SPOT_SERIES[spot_key]["excel_column"])
+        spot_sheet.cell(row=row_idx, column=headers[column_name], value=float(price))
+        saved[spot_key] = float(price)
+
+    backup_path = backup_excel(path)
+    save_business_workbook(workbook, path)
+    return {"saved": saved, "backup": backup_path}
+
+
+def normalize_futures_product(value: Any, contract_code: str | None = None) -> str:
+    text = str(value or "").strip().upper()
+    aliases = {"热轧卷板": "HC", "热卷": "HC", "螺纹钢": "RB", "螺纹": "RB"}
+    if text in aliases:
+        return aliases[text]
+    if text in PRODUCT_NAMES:
+        return text
+    if contract_code:
+        prefix = re.match(r"^[A-Z]+", contract_code.upper())
+        if prefix and prefix.group(0) in PRODUCT_NAMES:
+            return prefix.group(0)
+    return normalize_product(text or None)
+
+
+def month_from_contract(contract_code: str, fallback_month: Any = None) -> int:
+    month = parse_number(fallback_month)
+    if month is not None:
+        return int(month)
+    match = re.search(r"(\d{2})$", contract_code.upper())
+    if match:
+        return int(match.group(1))
+    raise_value("Invalid contract month")
+
+
+def write_futures_to_excel(
+    date_text: str,
+    product: str,
+    contract_month: int,
+    contract_code: str,
+    close: float,
+    source: str,
+    path: Path = EXCEL_PATH,
+) -> dict[str, Any]:
+    product = normalize_product(product)
+    contract = contract_code.upper()
+    workbook = load_business_workbook(path)
+    _spot_sheet, futures_sheet = ensure_excel_structure(workbook)
+    headers = ensure_headers(futures_sheet, FUTURES_HEADERS)
+    row_idx = None
+    for candidate in range(2, futures_sheet.max_row + 1):
+        same_date = parse_date(futures_sheet.cell(candidate, headers["日期"]).value) == date_text
+        same_product = normalize_futures_product(
+            futures_sheet.cell(candidate, headers["品种"]).value,
+            str(futures_sheet.cell(candidate, headers["合约代码"]).value or ""),
+        ) == product
+        same_contract = str(futures_sheet.cell(candidate, headers["合约代码"]).value or "").strip().upper() == contract
+        if same_date and same_product and same_contract:
+            row_idx = candidate
+            break
+    if row_idx is None:
+        row_idx = futures_sheet.max_row + 1
+
+    values = {
+        "日期": date_text,
+        "品种": product,
+        "合约月": int(contract_month),
+        "合约代码": contract,
+        "收盘价": float(close),
+        "来源": source,
+        "更新时间": now_iso(),
+    }
+    for header, value in values.items():
+        futures_sheet.cell(row=row_idx, column=headers[header], value=value)
+
+    backup_path = backup_excel(path)
+    save_business_workbook(workbook, path)
+    return {"backup": backup_path}
+
+
 def import_spot_excel(path: Path = EXCEL_PATH) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Excel file not found: {path}")
 
     workbook = load_workbook(path, read_only=True, data_only=True)
-    sheet = workbook[workbook.sheetnames[0]]
+    sheet = workbook[SPOT_SHEET_NAME] if SPOT_SHEET_NAME in workbook.sheetnames else workbook[workbook.sheetnames[0]]
     rows = sheet.iter_rows(values_only=True)
     headers = [str(v).strip() if v is not None else "" for v in next(rows)]
 
@@ -199,6 +392,8 @@ def import_spot_excel(path: Path = EXCEL_PATH) -> dict[str, Any]:
     skipped = 0
     latest_date = None
     with connect() as conn:
+        conn.execute("DELETE FROM spot_series_prices")
+        conn.execute("DELETE FROM spot_prices")
         for row in rows:
             date_text = parse_date(row[date_idx] if date_idx < len(row) else None)
             if not date_text:
@@ -215,14 +410,8 @@ def import_spot_excel(path: Path = EXCEL_PATH) -> dict[str, Any]:
                     INSERT INTO spot_series_prices(date, spot_key, price, source, updated_at)
                     VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(date, spot_key) DO UPDATE SET
-                        price = CASE
-                            WHEN spot_series_prices.source = 'manual' THEN spot_series_prices.price
-                            ELSE excluded.price
-                        END,
-                        source = CASE
-                            WHEN spot_series_prices.source = 'manual' THEN spot_series_prices.source
-                            ELSE excluded.source
-                        END,
+                        price = excluded.price,
+                        source = excluded.source,
                         updated_at = excluded.updated_at
                     """,
                     (date_text, spot_key, price, "excel", now_iso()),
@@ -237,10 +426,7 @@ def import_spot_excel(path: Path = EXCEL_PATH) -> dict[str, Any]:
                         VALUES (?, ?, ?, ?)
                         ON CONFLICT(date) DO UPDATE SET
                             shanghai_hotcoil = excluded.shanghai_hotcoil,
-                            source = CASE
-                                WHEN spot_prices.source = 'manual' THEN spot_prices.source
-                                ELSE excluded.source
-                            END,
+                            source = excluded.source,
                             updated_at = excluded.updated_at
                         """,
                         (date_text, price, "excel", now_iso()),
@@ -257,6 +443,174 @@ def import_spot_excel(path: Path = EXCEL_PATH) -> dict[str, Any]:
         "imported_by_series": imported_by_series,
         "skipped": skipped,
         "latest_date": latest_date,
+    }
+
+
+def import_futures_excel(path: Path = EXCEL_PATH) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Excel file not found: {path}")
+
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    if FUTURES_SHEET_NAME not in workbook.sheetnames:
+        return {"imported": 0, "skipped": 0, "latest_date": None}
+
+    sheet = workbook[FUTURES_SHEET_NAME]
+    rows = sheet.iter_rows(values_only=True)
+    try:
+        headers = [str(v).strip() if v is not None else "" for v in next(rows)]
+    except StopIteration:
+        return {"imported": 0, "skipped": 0, "latest_date": None}
+
+    missing = [header for header in FUTURES_HEADERS if header not in headers]
+    if missing:
+        raise ValueError(f"期货收盘 sheet missing columns: {', '.join(missing)}")
+    indexes = {header: headers.index(header) for header in FUTURES_HEADERS}
+
+    imported = 0
+    skipped = 0
+    latest_date = None
+    with connect() as conn:
+        conn.execute("DELETE FROM futures_prices")
+        for row in rows:
+            date_text = parse_date(row[indexes["日期"]] if indexes["日期"] < len(row) else None)
+            contract = str(row[indexes["合约代码"]] if indexes["合约代码"] < len(row) else "").strip().upper()
+            close = parse_number(row[indexes["收盘价"]] if indexes["收盘价"] < len(row) else None)
+            if not date_text or not contract or close is None:
+                skipped += 1
+                continue
+            product = normalize_futures_product(
+                row[indexes["品种"]] if indexes["品种"] < len(row) else None,
+                contract,
+            )
+            month = month_from_contract(
+                contract,
+                row[indexes["合约月"]] if indexes["合约月"] < len(row) else None,
+            )
+            source = str(row[indexes["来源"]] if indexes["来源"] < len(row) and row[indexes["来源"]] else "excel")
+            updated_at = str(
+                row[indexes["更新时间"]]
+                if indexes["更新时间"] < len(row) and row[indexes["更新时间"]]
+                else now_iso()
+            )
+            save_futures_sqlite(
+                date_text,
+                product,
+                month,
+                contract,
+                close,
+                source,
+                updated_at=updated_at,
+                conn=conn,
+            )
+            imported += 1
+            latest_date = max(latest_date or date_text, date_text)
+
+    return {"imported": imported, "skipped": skipped, "latest_date": latest_date}
+
+
+def sync_from_excel(path: Path = EXCEL_PATH) -> dict[str, Any]:
+    spot = import_spot_excel(path)
+    futures = import_futures_excel(path)
+    return {
+        "spot": spot,
+        "futures": futures,
+        "imported": spot["imported"] + futures["imported"],
+        "skipped": spot["skipped"] + futures["skipped"],
+    }
+
+
+def sync_sqlite_business_data_to_excel(path: Path = EXCEL_PATH) -> dict[str, Any]:
+    """One-time migration: merge current SQLite business rows back into Excel."""
+    init_db()
+    workbook = load_business_workbook(path)
+    spot_sheet, futures_sheet = ensure_excel_structure(workbook)
+    spot_headers = ensure_headers(spot_sheet, SPOT_HEADERS)
+    futures_headers = ensure_headers(futures_sheet, FUTURES_HEADERS)
+
+    spot_rows_by_date: dict[str, int] = {}
+    for row_idx in range(2, spot_sheet.max_row + 1):
+        date_text = parse_date(spot_sheet.cell(row=row_idx, column=spot_headers["日期"]).value)
+        if date_text:
+            spot_rows_by_date[date_text] = row_idx
+
+    futures_rows_by_key: dict[tuple[str, str, str], int] = {}
+    for row_idx in range(2, futures_sheet.max_row + 1):
+        date_text = parse_date(futures_sheet.cell(row=row_idx, column=futures_headers["日期"]).value)
+        contract = str(futures_sheet.cell(row=row_idx, column=futures_headers["合约代码"]).value or "").strip().upper()
+        if not date_text or not contract:
+            continue
+        product = normalize_futures_product(
+            futures_sheet.cell(row=row_idx, column=futures_headers["品种"]).value,
+            contract,
+        )
+        futures_rows_by_key[(date_text, product, contract)] = row_idx
+
+    spot_written = 0
+    futures_written = 0
+    with connect() as conn:
+        spot_rows = conn.execute(
+            """
+            SELECT date, spot_key, price, source
+            FROM spot_series_prices
+            ORDER BY date, spot_key
+            """
+        ).fetchall()
+        futures_rows = conn.execute(
+            """
+            SELECT date, product, contract_month, contract_code, close, source, updated_at
+            FROM futures_prices
+            ORDER BY date, product, contract_code
+            """
+        ).fetchall()
+
+    for row in spot_rows:
+        spot_key = normalize_spot_key(row["spot_key"])
+        date_text = parse_date(row["date"])
+        if not date_text:
+            continue
+        row_idx = spot_rows_by_date.get(date_text)
+        if row_idx is None:
+            row_idx = spot_sheet.max_row + 1
+            spot_sheet.cell(row=row_idx, column=spot_headers["日期"], value=date_text)
+            spot_rows_by_date[date_text] = row_idx
+        col_idx = spot_headers[str(SPOT_SERIES[spot_key]["excel_column"])]
+        should_write = row["source"] == "manual" or not excel_cell_has_value(spot_sheet, row_idx, col_idx)
+        if should_write:
+            spot_sheet.cell(row=row_idx, column=col_idx, value=float(row["price"]))
+            spot_written += 1
+
+    for row in futures_rows:
+        date_text = parse_date(row["date"])
+        if not date_text:
+            continue
+        product = normalize_product(row["product"])
+        contract = str(row["contract_code"]).upper()
+        key = (date_text, product, contract)
+        row_idx = futures_rows_by_key.get(key)
+        if row_idx is None:
+            row_idx = futures_sheet.max_row + 1
+            futures_rows_by_key[key] = row_idx
+        values = {
+            "日期": date_text,
+            "品种": product,
+            "合约月": int(row["contract_month"]),
+            "合约代码": contract,
+            "收盘价": float(row["close"]),
+            "来源": row["source"] or "sqlite",
+            "更新时间": row["updated_at"] or now_iso(),
+        }
+        for header, value in values.items():
+            futures_sheet.cell(row=row_idx, column=futures_headers[header], value=value)
+        futures_written += 1
+
+    backup_path = backup_excel(path)
+    save_business_workbook(workbook, path)
+    sync_result = sync_from_excel(path)
+    return {
+        "backup": backup_path,
+        "spot_written": spot_written,
+        "futures_written": futures_written,
+        "sync": sync_result,
     }
 
 
@@ -491,10 +845,46 @@ def save_spot(
     source: str = "manual",
     spot_key: str = "shanghai_hotcoil",
 ) -> None:
-    parse_date(date_text) or raise_value("Invalid date")
-    spot_key = normalize_spot_key(spot_key)
+    save_spots(date_text, {spot_key: price}, source=source)
+
+
+def save_spots(
+    date_text: str,
+    prices_by_spot: dict[str, float],
+    source: str = "manual",
+) -> dict[str, Any]:
+    date_text = parse_date(date_text) or raise_value("Invalid date")
+    cleaned: dict[str, float] = {}
+    for spot_key, raw_price in prices_by_spot.items():
+        spot_key = normalize_spot_key(spot_key)
+        price = parse_number(raw_price)
+        if price is None:
+            raise_value(f"Invalid spot price for {spot_key}")
+        cleaned[spot_key] = float(price)
+    if not cleaned:
+        raise_value("No spot prices to save")
+
+    excel_result = write_spots_to_excel(date_text, cleaned)
     with connect() as conn:
-        conn.execute(
+        for spot_key, price in cleaned.items():
+            save_spot_sqlite(date_text, price, source=source, spot_key=spot_key, conn=conn)
+    return {"saved": excel_result["saved"], "backup": excel_result["backup"]}
+
+
+def save_spot_sqlite(
+    date_text: str,
+    price: float,
+    source: str = "manual",
+    spot_key: str = "shanghai_hotcoil",
+    updated_at: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    date_text = parse_date(date_text) or raise_value("Invalid date")
+    spot_key = normalize_spot_key(spot_key)
+    timestamp = updated_at or now_iso()
+
+    def write(target: sqlite3.Connection) -> None:
+        target.execute(
             """
             INSERT INTO spot_series_prices(date, spot_key, price, source, updated_at)
             VALUES (?, ?, ?, ?, ?)
@@ -503,10 +893,10 @@ def save_spot(
                 source = excluded.source,
                 updated_at = excluded.updated_at
             """,
-            (date_text, spot_key, float(price), source, now_iso()),
+            (date_text, spot_key, float(price), source, timestamp),
         )
         if spot_key == "shanghai_hotcoil":
-            conn.execute(
+            target.execute(
                 """
                 INSERT INTO spot_prices(date, shanghai_hotcoil, source, updated_at)
                 VALUES (?, ?, ?, ?)
@@ -515,8 +905,14 @@ def save_spot(
                     source = excluded.source,
                     updated_at = excluded.updated_at
                 """,
-                (date_text, float(price), source, now_iso()),
+                (date_text, float(price), source, timestamp),
             )
+
+    if conn is None:
+        with connect() as owned_conn:
+            write(owned_conn)
+    else:
+        write(conn)
 
 
 def save_futures(
@@ -528,8 +924,28 @@ def save_futures(
     source: str,
 ) -> None:
     product = normalize_product(product)
-    with connect() as conn:
-        conn.execute(
+    date_text = parse_date(date_text) or raise_value("Invalid date")
+    contract = contract_code.upper()
+    write_futures_to_excel(date_text, product, int(contract_month), contract, float(close), source)
+    save_futures_sqlite(date_text, product, int(contract_month), contract, float(close), source)
+
+
+def save_futures_sqlite(
+    date_text: str,
+    product: str,
+    contract_month: int,
+    contract_code: str,
+    close: float,
+    source: str,
+    updated_at: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    product = normalize_product(product)
+    date_text = parse_date(date_text) or raise_value("Invalid date")
+    timestamp = updated_at or now_iso()
+
+    def write(target: sqlite3.Connection) -> None:
+        target.execute(
             """
             INSERT INTO futures_prices(date, product, contract_month, contract_code, close, source, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -545,9 +961,15 @@ def save_futures(
                 contract_code.upper(),
                 float(close),
                 source,
-                now_iso(),
+                timestamp,
             ),
         )
+
+    if conn is None:
+        with connect() as owned_conn:
+            write(owned_conn)
+    else:
+        write(conn)
 
 
 def raise_value(message: str) -> None:
@@ -993,7 +1415,7 @@ class AppHandler(BaseHTTPRequestHandler):
             path = self.path.split("?", 1)[0]
             payload = self.read_json()
             if path == "/api/import-excel":
-                self.send_json(import_spot_excel())
+                self.send_json(sync_from_excel())
             elif path == "/api/spot":
                 date_text = parse_date(payload.get("date")) or raise_value("Invalid date")
                 price = parse_number(payload.get("price"))
@@ -1004,18 +1426,18 @@ class AppHandler(BaseHTTPRequestHandler):
             elif path == "/api/spots":
                 date_text = parse_date(payload.get("date")) or raise_value("Invalid date")
                 prices = payload.get("prices") or {}
-                saved = {}
+                cleaned = {}
                 for spot_key, raw_price in prices.items():
                     if raw_price in (None, ""):
                         continue
                     price = parse_number(raw_price)
                     if price is None:
                         raise_value(f"Invalid spot price for {spot_key}")
-                    save_spot(date_text, price, spot_key=spot_key)
-                    saved[spot_key] = price
-                if not saved:
+                    cleaned[spot_key] = price
+                if not cleaned:
                     raise_value("No spot prices to save")
-                self.send_json({"ok": True, "date": date_text, "saved": saved})
+                result = save_spots(date_text, cleaned)
+                self.send_json({"ok": True, "date": date_text, **result})
             elif path == "/api/futures":
                 date_text = parse_date(payload.get("date")) or raise_value("Invalid date")
                 product = normalize_product(payload.get("product"))
@@ -1516,7 +1938,7 @@ HTML = r"""
           <div class="row" style="margin-top: 8px;">
             <button id="fetchMissingBtn">补当前合约月</button>
             <button class="primary" id="fetchMissingAllBtn">补 05/10/01</button>
-            <button id="importExcelBtn">重读 Excel</button>
+            <button id="importExcelBtn">从 Excel 同步</button>
           </div>
           <div class="hint" id="batchStatus" style="margin-top: 8px;"></div>
         </div>
@@ -1956,7 +2378,7 @@ function attachEvents() {
 
   $('importExcelBtn').addEventListener('click', () => withBusy('importExcelBtn', async () => {
     const data = await api('/api/import-excel', {method: 'POST', body: '{}'});
-    $('batchStatus').textContent = `Excel 已重读：导入 ${data.imported} 行，跳过 ${data.skipped} 行。`;
+    $('batchStatus').textContent = `Excel 已同步：现货 ${data.spot.imported} 条，期货 ${data.futures.imported} 条，跳过 ${data.skipped} 行。`;
     await refreshState();
     await refreshCharts();
   }));
@@ -2026,21 +2448,9 @@ function showTooltip(event, chartKey) {
 
 def bootstrap() -> None:
     init_db()
-    with connect() as conn:
-        legacy_count = conn.execute("SELECT COUNT(*) AS n FROM spot_prices").fetchone()["n"]
-        series_count = conn.execute("SELECT COUNT(*) AS n FROM spot_series_prices").fetchone()["n"]
-        missing_series = [
-            spot_key
-            for spot_key in SPOT_SERIES
-            if conn.execute(
-                "SELECT COUNT(*) AS n FROM spot_series_prices WHERE spot_key = ?",
-                (spot_key,),
-            ).fetchone()["n"]
-            == 0
-        ]
-    if (legacy_count == 0 or series_count == 0 or missing_series) and EXCEL_PATH.exists():
-        result = import_spot_excel(EXCEL_PATH)
-        print(f"Imported spot data: {result}", flush=True)
+    if EXCEL_PATH.exists():
+        result = sync_from_excel(EXCEL_PATH)
+        print(f"Synced business data from Excel: {result}", flush=True)
 
 
 def main() -> None:
@@ -2053,4 +2463,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if "--sync-sqlite-to-excel" in sys.argv:
+        print(json.dumps(sync_sqlite_business_data_to_excel(), ensure_ascii=False, indent=2))
+    else:
+        main()
