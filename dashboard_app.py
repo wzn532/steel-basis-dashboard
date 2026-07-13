@@ -1816,7 +1816,7 @@ HTML = r"""
         <div class="chart-toolbar">
           <div>
             <h2>基差季节性图</h2>
-            <div class="hint">中心库、杭州中天、乐从热卷、上海热卷；基差 = 现货价 - 对应合约收盘价</div>
+            <div class="hint">普方坯、广州韶钢、中心库、杭州中天、乐从热卷、上海热卷；基差 = 现货价 - 对应合约收盘价</div>
           </div>
           <div class="row">
             <div class="segmented" id="monthTabs">
@@ -1835,6 +1835,26 @@ HTML = r"""
           </table>
         </div>
         <div class="chart-grid">
+          <section class="chart-card">
+            <div class="chart-card-head">
+              <div>
+                <h3>普方坯基差季节性</h3>
+                <div class="hint" id="billetChartHint">基差 = 普方坯现货价 - 对应 RB 合约收盘价</div>
+              </div>
+            </div>
+            <canvas id="billetBasisChart" width="560" height="420"></canvas>
+            <div class="status" id="billetChartStatus"></div>
+          </section>
+          <section class="chart-card">
+            <div class="chart-card-head">
+              <div>
+                <h3>广州韶钢基差季节性</h3>
+                <div class="hint" id="guangzhouShaogangChartHint">基差 = 广州韶钢现货价 - 对应 RB 合约收盘价</div>
+              </div>
+            </div>
+            <canvas id="guangzhouShaogangBasisChart" width="560" height="420"></canvas>
+            <div class="status" id="guangzhouShaogangChartStatus"></div>
+          </section>
           <section class="chart-card">
             <div class="chart-card-head">
               <div>
@@ -1987,6 +2007,26 @@ const SPOT_ENTRY_GROUPS = [
   }
 ];
 const CHARTS = {
+  billet: {
+    title: '普方坯',
+    spotKey: 'billet',
+    product: 'RB',
+    canvasId: 'billetBasisChart',
+    hintId: 'billetChartHint',
+    statusId: 'billetChartStatus',
+    points: [],
+    hoverPoints: []
+  },
+  guangzhouShaogang: {
+    title: '广州韶钢',
+    spotKey: 'guangzhou_shaogang',
+    product: 'RB',
+    canvasId: 'guangzhouShaogangBasisChart',
+    hintId: 'guangzhouShaogangChartHint',
+    statusId: 'guangzhouShaogangChartStatus',
+    points: [],
+    hoverPoints: []
+  },
   centerWarehouse: {
     title: '中心库',
     spotKey: 'center_warehouse',
