@@ -362,6 +362,58 @@ def write_futures_to_excel(
     return {"backup": backup_path}
 
 
+def write_futures_batch_to_excel(
+    futures_rows: list[dict[str, Any]],
+    path: Path = EXCEL_PATH,
+) -> dict[str, Any]:
+    if not futures_rows:
+        return {"backup": None, "saved": 0}
+
+    workbook = load_business_workbook(path)
+    _spot_sheet, futures_sheet = ensure_excel_structure(workbook)
+    headers = ensure_headers(futures_sheet, FUTURES_HEADERS)
+
+    rows_by_key: dict[tuple[str, str, str], int] = {}
+    for row_idx in range(2, futures_sheet.max_row + 1):
+        date_text = parse_date(futures_sheet.cell(row_idx, headers["日期"]).value)
+        contract = str(futures_sheet.cell(row_idx, headers["合约代码"]).value or "").strip().upper()
+        if not date_text or not contract:
+            continue
+        product = normalize_futures_product(
+            futures_sheet.cell(row_idx, headers["品种"]).value,
+            contract,
+        )
+        rows_by_key[(date_text, product, contract)] = row_idx
+
+    saved = 0
+    for item in futures_rows:
+        date_text = parse_date(item.get("date")) or raise_value("Invalid date")
+        product = normalize_product(item.get("product"))
+        contract = str(item.get("contract_code") or "").upper()
+        if not contract:
+            raise_value("Invalid contract code")
+        row_idx = rows_by_key.get((date_text, product, contract))
+        if row_idx is None:
+            row_idx = futures_sheet.max_row + 1
+            rows_by_key[(date_text, product, contract)] = row_idx
+        values = {
+            "日期": date_text,
+            "品种": product,
+            "合约月": int(item.get("contract_month")),
+            "合约代码": contract,
+            "收盘价": float(item.get("close")),
+            "来源": item.get("source") or "manual",
+            "更新时间": item.get("updated_at") or now_iso(),
+        }
+        for header, value in values.items():
+            futures_sheet.cell(row=row_idx, column=headers[header], value=value)
+        saved += 1
+
+    backup_path = backup_excel(path)
+    save_business_workbook(workbook, path)
+    return {"backup": backup_path, "saved": saved}
+
+
 def import_spot_excel(path: Path = EXCEL_PATH) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Excel file not found: {path}")
@@ -930,6 +982,45 @@ def save_futures(
     save_futures_sqlite(date_text, product, int(contract_month), contract, float(close), source)
 
 
+def save_futures_batch(futures_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not futures_rows:
+        return {"backup": None, "saved": 0}
+    normalized_rows: list[dict[str, Any]] = []
+    for row in futures_rows:
+        date_text = parse_date(row.get("date")) or raise_value("Invalid date")
+        product = normalize_product(row.get("product"))
+        contract = str(row.get("contract_code") or "").upper()
+        close = parse_number(row.get("close"))
+        if not contract or close is None:
+            raise_value("Invalid futures row")
+        normalized_rows.append(
+            {
+                "date": date_text,
+                "product": product,
+                "contract_month": int(row.get("contract_month")),
+                "contract_code": contract,
+                "close": float(close),
+                "source": row.get("source") or "manual",
+                "updated_at": row.get("updated_at") or now_iso(),
+            }
+        )
+
+    excel_result = write_futures_batch_to_excel(normalized_rows)
+    with connect() as conn:
+        for row in normalized_rows:
+            save_futures_sqlite(
+                row["date"],
+                row["product"],
+                row["contract_month"],
+                row["contract_code"],
+                row["close"],
+                row["source"],
+                updated_at=row["updated_at"],
+                conn=conn,
+            )
+    return {"backup": excel_result["backup"], "saved": len(normalized_rows)}
+
+
 def save_futures_sqlite(
     date_text: str,
     product: str,
@@ -1246,6 +1337,7 @@ def fetch_missing(
     saved = 0
     error_count = 0
     errors: list[str] = []
+    futures_to_save: list[dict[str, Any]] = []
     with connect() as conn:
         rows = conn.execute(
             """
@@ -1269,14 +1361,30 @@ def fetch_missing(
         attempted += 1
         try:
             close, source = fetch_contract_close_with_source(date_text, contract)
-            save_futures(date_text, product, month, contract, close, source)
+            futures_to_save.append(
+                {
+                    "date": date_text,
+                    "product": product,
+                    "contract_month": month,
+                    "contract_code": contract,
+                    "close": close,
+                    "source": source,
+                }
+            )
             saved += 1
             time.sleep(0.15)
         except Exception as exc:
             error_count += 1
             if len(errors) < 8:
                 errors.append(f"{date_text} {contract}: {exc}")
-    return {"attempted": attempted, "saved": saved, "error_count": error_count, "errors": errors}
+    batch = save_futures_batch(futures_to_save) if futures_to_save else {"backup": None}
+    return {
+        "attempted": attempted,
+        "saved": saved,
+        "error_count": error_count,
+        "errors": errors,
+        "backup": batch["backup"],
+    }
 
 
 def fetch_missing_all_months(
@@ -1291,6 +1399,7 @@ def fetch_missing_all_months(
     skipped_existing = 0
     error_count = 0
     errors: list[str] = []
+    futures_to_save: list[dict[str, Any]] = []
     with connect() as conn:
         rows = conn.execute(
             """
@@ -1332,7 +1441,16 @@ def fetch_missing_all_months(
             contract = next_contract_code(date_text, product, month)
             try:
                 close, source = fetch_contract_close_with_source(date_text, contract)
-                save_futures(date_text, product, month, contract, close, source)
+                futures_to_save.append(
+                    {
+                        "date": date_text,
+                        "product": product,
+                        "contract_month": month,
+                        "contract_code": contract,
+                        "close": close,
+                        "source": source,
+                    }
+                )
                 saved += 1
             except Exception as exc:
                 error_count += 1
@@ -1340,12 +1458,14 @@ def fetch_missing_all_months(
                     errors.append(f"{date_text} {contract}: {exc}")
         time.sleep(0.15)
 
+    batch = save_futures_batch(futures_to_save) if futures_to_save else {"backup": None}
     return {
         "attempted_dates": attempted_dates,
         "saved": saved,
         "skipped_existing": skipped_existing,
         "error_count": error_count,
         "errors": errors,
+        "backup": batch["backup"],
     }
 
 
